@@ -79,18 +79,19 @@ type Manager struct {
 	config    *Config
 	listeners map[string]net.Listener
 
-	caserver               *ca.Server
-	Dispatcher             *dispatcher.Dispatcher
-	replicatedOrchestrator *orchestrator.ReplicatedOrchestrator
-	globalOrchestrator     *orchestrator.GlobalOrchestrator
-	taskReaper             *orchestrator.TaskReaper
-	scheduler              *scheduler.Scheduler
-	allocator              *allocator.Allocator
-	keyManager             *keymanager.KeyManager
-	server                 *grpc.Server
-	localserver            *grpc.Server
-	RaftNode               *raft.Node
-	connSelector           *raftpicker.ConnSelector
+	caserver           *ca.Server
+	Dispatcher         *dispatcher.Dispatcher
+	globalOrchestrator *orchestrator.GlobalOrchestrator
+	taskReaper         *orchestrator.TaskReaper
+	scheduler          *scheduler.Scheduler
+	allocator          *allocator.Allocator
+	keyManager         *keymanager.KeyManager
+	server             *grpc.Server
+	localserver        *grpc.Server
+	RaftNode           *raft.Node
+	connSelector       *raftpicker.ConnSelector
+
+	leader *Leader
 
 	mu sync.Mutex
 
@@ -333,8 +334,9 @@ func (m *Manager) Run(parent context.Context) error {
 				if err != nil {
 					log.G(ctx).WithError(err).Error("root key-encrypting-key rotation failed")
 				}
+				m.leader = NewLeader(m.RaftNode)
+				m.leader.Start(ctx)
 
-				m.replicatedOrchestrator = orchestrator.NewReplicatedOrchestrator(s)
 				m.globalOrchestrator = orchestrator.NewGlobalOrchestrator(s)
 				m.taskReaper = orchestrator.NewTaskReaper(s)
 				m.scheduler = scheduler.New(s)
@@ -393,12 +395,6 @@ func (m *Manager) Run(parent context.Context) error {
 					taskReaper.Run()
 				}(m.taskReaper)
 
-				go func(orchestrator *orchestrator.ReplicatedOrchestrator) {
-					if err := orchestrator.Run(ctx); err != nil {
-						log.G(ctx).WithError(err).Error("replicated orchestrator exited with an error")
-					}
-				}(m.replicatedOrchestrator)
-
 				go func(globalOrchestrator *orchestrator.GlobalOrchestrator) {
 					if err := globalOrchestrator.Run(ctx); err != nil {
 						log.G(ctx).WithError(err).Error("global orchestrator exited with an error")
@@ -414,8 +410,7 @@ func (m *Manager) Run(parent context.Context) error {
 					m.allocator = nil
 				}
 
-				m.replicatedOrchestrator.Stop()
-				m.replicatedOrchestrator = nil
+				m.leader.Stop(ctx)
 
 				m.globalOrchestrator.Stop()
 				m.globalOrchestrator = nil
@@ -609,9 +604,11 @@ func (m *Manager) Stop(ctx context.Context) {
 	if m.allocator != nil {
 		m.allocator.Stop()
 	}
-	if m.replicatedOrchestrator != nil {
-		m.replicatedOrchestrator.Stop()
+
+	if m.leader != nil {
+		m.leader.Stop(ctx)
 	}
+
 	if m.globalOrchestrator != nil {
 		m.globalOrchestrator.Stop()
 	}

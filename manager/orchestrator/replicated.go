@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"sync"
 	"time"
 
 	"github.com/docker/swarmkit/api"
@@ -20,6 +21,10 @@ type ReplicatedOrchestrator struct {
 	reconcileServices map[string]*api.Service
 	restartTasks      map[string]struct{}
 
+	started   chan struct{}
+	startOnce sync.Once // start only once
+	stopOnce  sync.Once // only allow stop to be called once
+
 	// stopChan signals to the state machine to stop running.
 	stopChan chan struct{}
 	// doneChan is closed when the state machine terminates.
@@ -37,6 +42,7 @@ func NewReplicatedOrchestrator(store *store.MemoryStore) *ReplicatedOrchestrator
 	updater := NewUpdateSupervisor(store, restartSupervisor)
 	return &ReplicatedOrchestrator{
 		store:             store,
+		started:           make(chan struct{}),
 		stopChan:          make(chan struct{}),
 		doneChan:          make(chan struct{}),
 		reconcileServices: make(map[string]*api.Service),
@@ -46,8 +52,21 @@ func NewReplicatedOrchestrator(store *store.MemoryStore) *ReplicatedOrchestrator
 	}
 }
 
+//
+func (r *ReplicatedOrchestrator) Start(ctx context.Context) error {
+	err := errStarted
+
+	r.startOnce.Do(func() {
+		close(r.started)
+		go r.run(ctx)
+		err = nil
+	})
+
+	return err
+}
+
 // Run contains the orchestrator event loop. It runs until Stop is called.
-func (r *ReplicatedOrchestrator) Run(ctx context.Context) error {
+func (r *ReplicatedOrchestrator) run(ctx context.Context) error {
 	defer close(r.doneChan)
 
 	// Watch changes to services and tasks
@@ -89,18 +108,39 @@ func (r *ReplicatedOrchestrator) Run(ctx context.Context) error {
 			case state.EventUpdateCluster:
 				r.cluster = v.Cluster
 			}
+		case <-ctx.Done():
 		case <-r.stopChan:
 			return nil
 		}
 	}
 }
 
-// Stop stops the orchestrator.
-func (r *ReplicatedOrchestrator) Stop() {
-	close(r.stopChan)
-	<-r.doneChan
-	r.updater.CancelAll()
-	r.restarts.CancelAll()
+// Stop stops the ReplicatedOrchestrator
+func (r *ReplicatedOrchestrator) Stop(ctx context.Context) error {
+	select {
+	case <-r.started:
+	default:
+		return errNotStarted
+	}
+
+	r.stop()
+
+	select {
+	case <-r.doneChan:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// stop stops the orchestrator.
+func (r *ReplicatedOrchestrator) stop() {
+	r.stopOnce.Do(func() {
+		close(r.stopChan)
+		<-r.doneChan
+		r.updater.CancelAll()
+		r.restarts.CancelAll()
+	})
 }
 
 func (r *ReplicatedOrchestrator) tick(ctx context.Context) {
